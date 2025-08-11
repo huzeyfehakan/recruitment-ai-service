@@ -3,9 +3,21 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from contextlib import asynccontextmanager
 from .core import processing
-from .models import (
-    ResumeParseRequest, SuccessResponse, ErrorResponse,
-    UnsupportedMediaTypeError, UnprocessableContentError
+from .core.exceptions import (
+    AppError,
+    UnsupportedMediaTypeError,
+    UnprocessableContentError,
+    InvalidRequestError,
+    EmptyStringError,
+)
+from .core.models import (
+    ResumeParseRequest,
+    ParsedResumeSuccess,
+    ErrorResponse,
+    PostingEmbeddingRequest,
+    PostingSuccess,
+    MatchAnalyzeRequest,
+    MatchAnalyzeSuccess,
 )
 
 # This new 'lifespan' function will run on application startup
@@ -26,46 +38,78 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+# ---- Unified error JSON helper ----
+def error_json(status_code: int, error_code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "VALIDATION_ERROR" if status_code < 500 else "ERROR",
+            "errorCode": error_code,
+            "message": message,
+        },
+    )
 
-@app.exception_handler(UnsupportedMediaTypeError)
-async def unsupported_media_type_handler(request: Request, exc: UnsupportedMediaTypeError):
-    return JSONResponse(status_code=415,
-                        content=ErrorResponse(status="VALIDATION_ERROR", errorCode="UNSUPPORTED_FILE_TYPE",
-                                              message="only pdf files are supported").model_dump())
-
-
-@app.exception_handler(UnprocessableContentError)
-async def unprocessable_content_handler(request: Request, exc: UnprocessableContentError):
-    return JSONResponse(status_code=422,
-                        content=ErrorResponse(status="VALIDATION_ERROR", errorCode="UNPROCESSABLE_CONTENT",
-                                              message=exc.message).model_dump())
-
+# ---- Global Exception Handlers ----
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError):
+    return error_json(exc.status_code, exc.error_code, exc.message)
 
 @app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    return JSONResponse(status_code=400, content=ErrorResponse(status="VALIDATION_ERROR", errorCode="INVALID_REQUEST",
-                                                               message="given url is not valid").model_dump())
+async def req_validation_handler(request: Request, exc: RequestValidationError):
+    return error_json(400, "INVALID_REQUEST", "given url is not valid")
 
+@app.exception_handler(HTTPException)
+async def http_exc_handler(request: Request, exc: HTTPException):
+    code = f"HTTP_{exc.status_code}"
+    msg = str(exc.detail or "unexpected error occured")
+    status = 500 if exc.status_code >= 500 else exc.status_code
+    return error_json(status, code, msg)
 
-# --- API Endpoint
-@app.post("/api/v1/parsed-resumes", response_model=SuccessResponse, status_code=200)
+@app.exception_handler(Exception)
+async def unhandled_handler(request: Request, exc: Exception):
+    # TODO: logger.exception("Unhandled", exc_info=exc)
+    return error_json(500, "INTERNAL_SERVER_ERROR", "unexpected error occured")
+
+# --- API Endpoint-1
+@app.post("/api/v1/parsed-resumes", response_model=ParsedResumeSuccess, status_code=200)
 async def parse_resume_endpoint(request: ResumeParseRequest):
-    try:
-        pdf_bytes = await processing.download_and_validate_cv(str(request.resume))
-        cv_text = processing.parse_pdf_text(pdf_bytes)
+    pdf_bytes = await processing.download_and_validate_cv(str(request.resume))
+    cv_text = processing.parse_pdf_text(pdf_bytes)
+    skills_data = await processing.extract_skills_from_text(cv_text)
+    cv_vector = await processing.generate_embedding_from_text(cv_text)
+    return ParsedResumeSuccess(
+        soft_skills=skills_data["soft_skills"],
+        tech_skills=skills_data["tech_skills"],
+        parsed_cv_vector=cv_vector,
+        parsed_cv_text = cv_text
+    )
+
+# --- API Endpoint-2
+@app.post("/api/v1/posting", response_model=PostingSuccess, status_code=200)
+async def posting_to_embedding_endpoint(request: PostingEmbeddingRequest):
+    if not request.posting_string or not request.posting_string.strip():
+        raise EmptyStringError("given string is not valid")
+
+    posting_vector = await processing.generate_posting_vector(request.posting_string)
+    return PostingSuccess(
+        posting_vector=posting_vector
+    )
 
 
-        skills_data = await processing.extract_skills_from_text(cv_text)
-        cv_vector = await processing.generate_embedding_from_text(cv_text)
-
-        return SuccessResponse(
-            soft_skills=skills_data["soft_skills"],
-            tech_skills=skills_data["tech_skills"],
-            parsed_cv=cv_vector
+# --- API Endpoint-3
+@app.post("/api/v1/match-analyze", response_model=MatchAnalyzeSuccess, status_code=200)
+async def match_analyze_endpoint(request: MatchAnalyzeRequest):
+    if (not request.parsed_cv or not request.parsed_cv.strip()
+            or not request.posting_string or not request.posting_string.strip()):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "VALIDATION_ERROR",
+                "result": "cv_vector and job_posting_vector are required and cannot be empty",
+            },
         )
-    except (UnsupportedMediaTypeError, UnprocessableContentError) as e:
-        raise e
-    except Exception as e:
-        # Daha detaylı hata loglaması
-        print(f"An unexpected error occurred: {e}")
-        raise HTTPException(status_code=500, detail="An unexpected internal server error occurred.")
+
+    analyze_result = await processing.analyze_match(request.parsed_cv, request.posting_string)
+    return MatchAnalyzeSuccess(
+        result=analyze_result
+    )

@@ -2,13 +2,12 @@ import os
 import httpx
 import fitz
 import json
-from io import BytesIO
-from ..models import UnsupportedMediaTypeError, UnprocessableContentError
+from .exceptions import InvalidRequestError, UnprocessableContentError
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 
-EMBEDDING_MODEL = "all-minilm"
-EXTRACTION_MODEL = "gemma:2b"
+EMBEDDING_MODEL = "nomic-embed-text"
+EXTRACTION_MODEL = "gemma2:2b"
 
 
 async def download_and_validate_cv(url: str) -> bytes:
@@ -18,7 +17,7 @@ async def download_and_validate_cv(url: str) -> bytes:
             response.raise_for_status()
             return response.content
         except httpx.RequestError as e:
-            raise UnprocessableContentError(f"URL is invalid or unreachable: {e.request.url}")
+            raise InvalidRequestError(f"given url is not valid: {getattr(e, 'request', None) and e.request.url}")
 
 
 def parse_pdf_text(pdf_bytes: bytes) -> str:
@@ -37,58 +36,77 @@ def parse_pdf_text(pdf_bytes: bytes) -> str:
         raise UnprocessableContentError(f"File is corrupt or not a valid PDF: {e}")
 
 
+
 async def extract_skills_from_text(text: str) -> dict:
-    prompt = f"""
-        You are an expert HR assistant. Your task is to extract technical skills (tech_skills) and soft skills (soft_skills) from the provided resume text and return them in JSON format.
+    tech_prompt = f"""
+    You are a precise data extraction robot. Your task is to identify and list technical skills from the provided CV text.
+    The CV text can be in English or Turkish. Extract the skills in English.
 
-        The resume text can be in English or Turkish. Analyze the text and extract the skills in their original language.
+    Instructions:
+    - Scan the ENTIRE CV text, including the summary, work history, and projects, not just a dedicated skills list.
+    - Look for programming languages, databases, frameworks, libraries, algorithms, tools, and technical concepts.
+    - Do NOT include skill levels (like 'Orta', 'Beginner').
+    - Do NOT include category headers (like 'Programlama Dilleri:').
+    - Do NOT include human languages (like 'English', 'Turkish').
+    - Respond ONLY with a single, clean, comma-separated list.
 
-        Create a JSON output for the following CV text. Provide ONLY the JSON output and nothing else. Tech skills and Soft skills will be mapped in to a list object in Python. Give a proper response.
+    CV Text:
+    ---
+    {text}
+    ---
+    """
 
-        CV Text:
-        ---
-        {text}
-        ---
-        """
-    final_chunk = {}
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    soft_prompt = f"""
+    You are an expert HR analyst. Your task is to INFER the candidate's soft skills from the descriptions of their actions, roles, and experiences in the CV text.
+
+    The CV text can be in English or Turkish.
+    
+    Instructions:
+    - Read the summary and work history sections carefully.
+    - Based on the actions described, infer the relevant soft skill. For example:
+    - If the text says "collaborated with team members" or "worked in a team", infer "Teamwork" and "Collaboration".
+    - If the text says "presented results to stakeholders" or "gained experience in customer communication", infer "Communication" and "Presentation Skills".
+    - If the text says "developed a new solution for a problem", infer "Problem Solving".
+    - Respond ONLY with a single, clean, comma-separated list of the skills you inferred.
+    - If the text contains no descriptions of actions from which to infer skills, respond with ONLY the word "NONE".
+
+
+    CV Text:
+    ---
+    {text}
+    ---
+    """
+
+    tech_skills_str = ""
+    soft_skills_str = ""
+
+    async with httpx.AsyncClient(timeout=300.0) as client:
         try:
-            payload = {
-                "model": EXTRACTION_MODEL,
-                "messages": [{'role': 'user', 'content': prompt}],
-                "format": "json",
-                "stream": False
-            }
-            async with client.stream("POST", f"{OLLAMA_HOST}/api/chat", json=payload) as response:
-                response.raise_for_status()
-                # We process the stream line by line and only keep the last one
-                async for line in response.aiter_lines():
-                    if line:
-                        chunk = json.loads(line)
-                        final_chunk = chunk # Keep overwriting until the last chunk
+            tech_response = await client.post(
+                f"{OLLAMA_HOST}/api/generate",
+                json={"model": EXTRACTION_MODEL, "prompt": tech_prompt, "stream": False}
+            )
+            tech_response.raise_for_status()
+            tech_skills_str = tech_response.json().get("response", "").strip()
 
-            # The full message is in the 'message' field of the final chunk
-            raw_content = final_chunk.get("message", {}).get("content", "")
+            soft_response = await client.post(
+                f"{OLLAMA_HOST}/api/generate",
+                json={"model": EXTRACTION_MODEL, "prompt": soft_prompt, "stream": False}
+            )
+            soft_response.raise_for_status()
+            soft_skills_str = soft_response.json().get("response", "").strip()
 
-            if not raw_content:
-                raise Exception("Ollama returned an empty response.")
+        except httpx.RequestError as e:
+            raise Exception(f"Failed to communicate with Ollama for skills extraction: {e}")
 
-            # Now we run our robust JSON extraction on the clean, final content
-            json_start = raw_content.find('{')
-            json_end = raw_content.rfind('}') + 1
+    tech_skills = [skill.strip() for skill in tech_skills_str.split(',') if skill.strip()]
 
-            if json_start != -1 and json_end > json_start:
-                json_string = raw_content[json_start:json_end]
-                response_json = json.loads(json_string)
-            else:
-                response_json = {}
+    if soft_skills_str.upper() == 'NONE':
+        soft_skills = []
+    else:
+        soft_skills = [skill.strip() for skill in soft_skills_str.split(',') if skill.strip()]
 
-            return {
-                "tech_skills": response_json.get("tech_skills", []),
-                "soft_skills": response_json.get("soft_skills", [])
-            }
-        except (httpx.RequestError, json.JSONDecodeError) as e:
-            raise Exception(f"Failed to communicate with or parse streaming response from Ollama: {e}")
+    return {"tech_skills": tech_skills, "soft_skills": soft_skills}
 
 async def generate_embedding_from_text(text: str) -> list[float]:
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -97,7 +115,8 @@ async def generate_embedding_from_text(text: str) -> list[float]:
                 f"{OLLAMA_HOST}/api/embeddings",
                 json={
                     "model": EMBEDDING_MODEL,
-                    "prompt": text
+                    "prompt": text,
+                    "options": { "num_ctx": 2048 }
                 }
             )
             response.raise_for_status()
@@ -129,3 +148,70 @@ async def ensure_model_is_pulled(model_name: str):
 
     except Exception as e:
         print(f"Failed to ensure model '{model_name}'. Error: {e}")
+
+async def generate_posting_vector(text: str) -> list[float]:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        try:
+            response = await client.post(
+                f"{OLLAMA_HOST}/api/embeddings",
+                json={
+                    "model": EMBEDDING_MODEL,
+                    "prompt": text,
+                    "options": {"num_ctx": 2048}
+                }
+            )
+            response.raise_for_status()
+            return response.json()["embedding"]
+        except httpx.RequestError as e:
+            raise Exception(f"Failed to communicate with Ollama for embedding: {e}")
+
+
+async def analyze_match(cv_text: str, posting_text: str) -> str:
+    prompt = f"""
+        You are a professional HR analyst. Your task is to analyze the provided CV and Job Posting and write a structured analysis.
+
+        IMPORTANT INSTRUCTIONS:
+        1.  The input texts (CV and Job Posting) can be in Turkish or English.
+        2.  Your entire analysis and output text MUST be in English.
+        3.  You must structure your response with the following three headings: "Strengths:", "Gaps:", and "Summary:".
+        4.  Under "Strengths:", create a bulleted list of matches between the CV and the job posting.
+        5.  Under "Gaps:", create a bulleted list of key requirements from the posting that are missing from the CV.
+        6.  Under "Summary:", write a final, 2-3 sentence professional conclusion about the candidate's suitability.
+        7.  Provide ONLY this structured text. Do not add any other conversational text.
+
+         --- 
+         CV 
+         --- 
+         {cv_text} 
+         --- 
+         JOB POSTING 
+         --- 
+         {posting_text}
+        """
+
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        try:
+           # opts = {}
+           # if EXTRACTION_MODEL.startswith("phi3"):
+              #  opts["num_ctx"] = 4096  # phi3 için güvenli bağlam uzunluğu
+               # opts["num_predict"] = 128
+
+            payload = {
+                "model": EXTRACTION_MODEL,
+                "messages": [{'role': 'user', 'content': prompt}],
+                "stream": False,
+                #"options": opts,
+            }
+
+            response = await client.post(f"{OLLAMA_HOST}/api/chat", json=payload)
+            response.raise_for_status()
+
+            summary_text = response.json().get("message", {}).get("content", "").strip()
+
+            if not summary_text:
+                raise Exception("Ollama returned an empty summary.")
+
+            return summary_text
+
+        except httpx.RequestError as e:
+            raise Exception(f"Failed to communicate with Ollama for match analysis: {e}")

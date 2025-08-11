@@ -1,4 +1,3 @@
-version: '3.8'
 
 services:
   ollama:
@@ -16,6 +15,5 @@ services:
       - ollama
     environment:
       - OLLAMA_HOST=http://ollama:11434
-
 volumes:
   ollama-data:
