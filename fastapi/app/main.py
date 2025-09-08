@@ -18,6 +18,9 @@ from .core.models import (
     PostingSuccess,
     MatchAnalyzeRequest,
     MatchAnalyzeSuccess,
+    PostingsRequest,
+    PostingsSuccess,
+    CVInfo
 )
 
 # This new 'lifespan' function will run on application startup
@@ -77,11 +80,14 @@ async def parse_resume_endpoint(request: ResumeParseRequest):
     cv_text = processing.parse_pdf_text(pdf_bytes)
     skills_data = await processing.extract_skills_from_text(cv_text)
     cv_vector = await processing.generate_embedding_from_text(cv_text)
+    cv_info = await processing.extract_cv_info(cv_text)
     return ParsedResumeSuccess(
         soft_skills=skills_data["soft_skills"],
         tech_skills=skills_data["tech_skills"],
         parsed_cv_vector=cv_vector,
-        parsed_cv_text = cv_text
+        parsed_cv_text = cv_text,
+        cv_info=CVInfo(**cv_info),
+
     )
 
 # --- API Endpoint-2
@@ -112,4 +118,15 @@ async def match_analyze_endpoint(request: MatchAnalyzeRequest):
     analyze_result = await processing.analyze_match(request.parsed_cv, request.posting_string)
     return MatchAnalyzeSuccess(
         result=analyze_result
+    )
+# --- API Endpoint-4
+@app.post("/api/v1/posting-bulk", response_model=PostingsSuccess, status_code=200)
+async def postings_to_embeddings_endpoint(request: PostingsRequest):
+    for posting in request.postings:
+        if not posting or not posting.strip():
+            raise EmptyStringError("given string is not valid")
+
+    posting_vectors = await processing.generate_embedding_from_postings(request.postings)
+    return PostingsSuccess(
+        posting_vectors=posting_vectors
     )
